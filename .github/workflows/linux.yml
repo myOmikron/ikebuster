@@ -33,6 +33,9 @@ jobs:
           rustup component add clippy
           cargo install clippy-sarif sarif-fmt cargo-deny
 
+      - name: Run tests
+        run: cargo test
+
       - name: Build ikebuster
         run: cargo build -p ikebuster -F bin
 

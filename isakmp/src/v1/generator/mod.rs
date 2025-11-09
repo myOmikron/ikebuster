@@ -42,7 +42,7 @@ pub struct Transform {
     pub key_size: Option<u16>,
 }
 
-/// Helper struct to build an crate message
+/// Helper struct to build a crate message
 pub struct MessageBuilder {
     transforms: Vec<Transform>,
 }

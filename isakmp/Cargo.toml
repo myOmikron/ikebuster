@@ -6,6 +6,9 @@ license = "MIT"
 authors = ["Niklas Pfister <git@omikron.dev>"]
 description = "Protocol implementation of isakmp"
 
+[lib]
+doctest = false
+
 [dependencies]
 # RNG
 rand = { version = "~0.9" }
@@ -17,6 +20,8 @@ serde = { version = "~1", features = ["derive"] }
 strum = { version = "~0.27", features = ["derive"] }
 # Error management
 thiserror = { version = "~2" }
+# Logging
+log = { version = "~0.4" }
 
 # Zerocost memory manipulation
 zerocopy = { version = "~0.7", features = ["derive"] }

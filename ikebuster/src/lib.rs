@@ -12,6 +12,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use isakmp::v1::definitions::AuthenticationMethod;
+use isakmp::v1::definitions::EncryptionAlgorithm;
+use isakmp::v1::definitions::GroupDescription;
+use isakmp::v1::definitions::HashAlgorithm;
 use isakmp::v1::definitions::NotifyMessageType;
 use isakmp::v1::generator::MessageBuilder;
 use isakmp::v1::generator::Transform;
@@ -31,9 +35,12 @@ use tracing::warn;
 use crate::recv::ReceiveError;
 use crate::utils::gen_transforms::gen_v1_transforms;
 use crate::utils::payload_to_transforms::payload_to_transforms;
+use crate::v2::probing::probe_target;
+use crate::v2::RECEIVE_TIMEOUT;
 
 mod recv;
 pub mod utils;
+pub mod v2;
 
 /// The results of the scan
 #[derive(Debug, Clone)]
@@ -59,22 +66,45 @@ pub struct ScanOptions {
     pub sleep_on_transform_found: Duration,
 }
 
-/// Scan the provided ip address
+/// Enum that signals which versions of IKE a destination supports
+#[derive(Debug, Clone)]
+pub enum SupportedVersions {
+    /// Only IKEv1 supported
+    V1,
+    /// Only IKEv2 supported
+    V2,
+    /// Both IKEv1 and IKEv2 supported
+    Both,
+    /// Neither IKEv1 nor IKEv2 supported
+    Neither,
+}
+
+pub(crate) async fn bind(
+    addr: IpAddr,
+    remote_port: u16,
+    listen_port: u16,
+) -> Result<UdpSocket, ScanError> {
+    let addr = SocketAddr::new(addr, remote_port);
+    let socket = match addr.ip() {
+        IpAddr::V4(_) => UdpSocket::bind(("0.0.0.0", listen_port))
+            .await
+            .map_err(ScanError::CouldNotBind)?,
+        IpAddr::V6(_) => UdpSocket::bind(("[::]", listen_port))
+            .await
+            .map_err(ScanError::CouldNotBind)?,
+    };
+    info!(
+        "Bound to {}",
+        socket.local_addr().map_err(ScanError::CouldNotBind)?
+    );
+    socket.connect(&addr).await.map_err(ScanError::Receive)?;
+    Ok(socket)
+}
+
+/// Scan the provided ip address using IKEv1
 #[instrument(skip_all)]
 pub async fn scan(opts: ScanOptions) -> Result<ScanResult, ScanError> {
-    // Initialize udp socket
-    let addr = SocketAddr::new(opts.ip, opts.port);
-
-    info!("Binding and starting to scan {addr}");
-    let socket = Arc::new(match addr.ip() {
-        IpAddr::V4(_) => UdpSocket::bind("0.0.0.0:500")
-            .await
-            .map_err(ScanError::CouldNotBind)?,
-        IpAddr::V6(_) => UdpSocket::bind("[::]:500")
-            .await
-            .map_err(ScanError::CouldNotBind)?,
-    });
-    socket.connect(&addr).await.map_err(ScanError::Receive)?;
+    let socket = Arc::new(bind(opts.ip, opts.port, 500).await?);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut interval = interval(Duration::from_millis(opts.interval));
@@ -130,7 +160,7 @@ pub async fn scan(opts: ScanOptions) -> Result<ScanResult, ScanError> {
                                         let other: Vec<Transform> = all.clone().into_iter().filter(|x| !transforms.contains(x)).collect();
 
                                         // Split the transforms into two new messages
-                                        let  [mut a,mut b] = [vec![], vec![]];
+                                        let [mut a, mut b] = [vec![], vec![]];
                                         for x in other {
                                             if a.len() == b.len() {
                                                 a.push(x);
@@ -215,7 +245,8 @@ pub async fn scan(opts: ScanOptions) -> Result<ScanResult, ScanError> {
                         open.insert(initiator_cookie, transforms);
                         socket.send(&msg).await.map_err(ScanError::Send)?;
                     }
-                }
+                    }
+
             }
         }
     }
@@ -231,4 +262,64 @@ pub enum ScanError {
     Receive(io::Error),
     #[error("Could not send: {0}")]
     Send(io::Error),
+    #[error("Could not generate IKEv2 packet: {0}")]
+    GeneratorFailed(isakmp::v2::generator::GeneratorError),
+    #[error("Timeout while sending/receiving data: {0:#?}")]
+    Timeout(Duration),
+    #[error("Destination is not capable of speaking IKEv2: {0}")]
+    IKEv2NotSupported(String),
+}
+
+/// Detect the supported IKE versions of a target address
+///
+/// This does not mean that the target actually accepts any proposals,
+/// but rather that any connectivity via the protocol worked.
+pub async fn detect_supported_versions(
+    target: IpAddr,
+    target_port: u16,
+    listen_port: u16,
+) -> Result<SupportedVersions, ScanError> {
+    let socket = Arc::new(bind(target, target_port, listen_port).await?);
+
+    let v2_supported = match tokio::time::timeout(RECEIVE_TIMEOUT, probe_target(&socket)).await {
+        Ok(v) => match v {
+            Ok(_) => true,
+            Err(e) => match e {
+                ScanError::IKEv2NotSupported(_) => false,
+                _ => return Err(e),
+            },
+        },
+        Err(_) => false,
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let rx_handle = tokio::spawn(recv::handle_receive(socket.clone(), tx));
+    let mut mb = MessageBuilder::new();
+    mb = mb.add_transform(Transform {
+        encryption_algorithm: EncryptionAlgorithm::AES_CBC,
+        hash_algorithm: HashAlgorithm::SHA2_256,
+        authentication_method: AuthenticationMethod::RSASignatures,
+        group_description: GroupDescription::MODP_4096,
+        key_size: Some(256),
+    });
+    let (msg, _) = mb.build();
+    socket.send(&msg).await.map_err(ScanError::Send)?;
+
+    let v1_supported = matches!(
+        tokio::time::timeout(RECEIVE_TIMEOUT, rx.recv()).await,
+        Ok(Some(Ok(_)))
+    );
+    rx_handle.abort();
+
+    Ok(if v2_supported {
+        if v1_supported {
+            SupportedVersions::Both
+        } else {
+            SupportedVersions::V2
+        }
+    } else if v1_supported {
+        SupportedVersions::V1
+    } else {
+        SupportedVersions::Neither
+    })
 }
